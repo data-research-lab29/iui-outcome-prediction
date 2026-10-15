@@ -1,0 +1,57 @@
+﻿# ======================
+# ENV / PYTHON
+# ======================
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+
+# ======================
+# DATA (raw / sensitive)
+# ======================
+data/
+*.csv
+
+# ======================
+# MODELS
+# ======================
+models/*
+!models/
+!models/saved_models/
+!models/saved_models/**
+!models/saved_models/**/*.joblib
+!models/saved_models/**/*.pkl
+
+# ======================
+# REPORTS / FIGURES
+# ======================
+reports/*
+!reports/
+!reports/figures/
+!reports/figures/**
+!reports/figures/**/*.png
+!reports/figures/**/*.jpg
+!reports/tables/
+!reports/tables/procedure_day_manifest.json
+!reports/tables/first_visit_tier_manifest.json
+
+# ======================
+# LOGS
+# ======================
+*.log
+*.tmp
+
+# ======================
+# SECRETS
+# ======================
+.env
+
+# ======================
+# MISC
+# ======================
+.ipynb_checkpoints/
+.DS_Store
+Thumbs.db
+
+src/temporal_validation_2026.ipynb
+catboost_info/

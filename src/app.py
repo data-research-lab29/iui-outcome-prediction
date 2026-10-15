@@ -1,0 +1,1440 @@
+import io
+import json
+import joblib
+import numpy as np
+import pandas as pd
+import shap
+import matplotlib.pyplot as plt
+import streamlit as st
+from pathlib import Path
+from datetime import datetime, timezone, timedelta
+
+from reportlab.lib.pagesizes import A4
+from reportlab.lib import colors
+from reportlab.lib.units import cm
+from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, HRFlowable
+from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+from reportlab.lib.enums import TA_CENTER, TA_LEFT, TA_RIGHT
+
+# =============================
+# Paths
+# =============================
+SRC_DIR      = Path(__file__).resolve().parent
+PROJECT_ROOT = SRC_DIR.parent
+
+PW_BASE_MODEL_PATH = PROJECT_ROOT / "models" / "saved_models" / "final_model" / "CatBoost_Baseline_calibration_base_model.joblib"
+PW_CALIBRATOR_PATH = PROJECT_ROOT / "models" / "saved_models" / "final_model" / "isotonic_calibrator_final_catboost.joblib"
+# Loaded from model_training.ipynb's saved Subtrain-fit imputer (not a hardcoded median), matching FV_IMPUTER_PATH's approach.
+PW_IMPUTER_PATH     = PROJECT_ROOT / "models" / "saved_models" / "final_model" / "imputer_final_catboost.joblib"
+PW_SHAP_IMG        = PROJECT_ROOT / "reports" / "figures" / "shap" / "shap_beeswarm.png"
+
+FV_BASE_MODEL_PATH = PROJECT_ROOT / "models" / "saved_models" / "first_visit_model" / "first_visit_calibration_base_model.joblib"
+FV_CALIBRATOR_PATH = PROJECT_ROOT / "models" / "saved_models" / "first_visit_model" / "first_visit_isotonic_calibrator.joblib"
+# Loaded from first_visit_model.ipynb's Subtrain-fit imputer, the single source of truth for imputation; FV_MEDIANS below is a display default only.
+FV_IMPUTER_PATH = PROJECT_ROOT / "models" / "saved_models" / "first_visit_model" / "first_visit_imputer.joblib"
+FV_SHAP_IMG        = PROJECT_ROOT / "reports" / "figures" / "first_visit_model" / "shap" / "shap_beeswarm_firstvisit.png"
+
+# =============================
+# Pathology-column set — shared by both models' Total_Female_Pathology
+# computation (see compute_pw_features / compute_fv_features).
+#
+# Multisystem_Factors is a separate clinician-recorded flag, not a pure
+# derived duplicate of the other 6 (agrees with Total_Female_Pathology
+# >=2 in 99.3% of cycles, disagrees in 21) -- excluded here to avoid
+# double-counting, but kept as its own input in FV_FEATURES.
+# =============================
+PATHOLOGY_COLS = [
+    "Uterine_Factors", "Tubal_Factors", "Ovarian_Factors",
+    "Ovulatory_Factors", "Cervical_Factors",
+    "Endometriosis_Factors",
+    # REMOVED: "Multisystem_Factors" -- see fix note above.
+]
+
+# =============================
+# Feature lists
+#
+# Matches model_training.ipynb cell 24's actual 11 selected features
+# (verified against notebook output and manuscript Table 2/Table 4).
+# =============================
+PW_FEATURES = [
+    "Uterine_Factors", "Total_Female_Pathology", "Age_Female",
+    "Menstrual_Interval_Days", "Ratio_TPMSC", "Post_TPMSC",
+    "Gynecological_Surgical_History", "First_Progressive_Motile",
+    "Age_FSH_Interaction", "First_Count", "Post_Count",
+]
+
+# First-Visit model locked at Full35 (Advanced_Age removed -- SHAP showed
+# a sign-reversal vs continuous Age_Female) with CatBoost__Baseline_NoResampling,
+# per first_visit_model.ipynb's FIRST_VISIT_FEATURES.
+FV_FEATURES = [
+    "Age_Female", "Age_Male", "Body_Mass_Index", "Total_infertile_duration",
+    "Infertility_Type", "Pregnancy_History", "Number_Of_Alive_Children",
+    "Number_Of_Miscarriages",
+    "Menstrual", "Menstrual_Interval_Days", "Menstrual_Duration_Days", "Dysmenorrhea",
+    "FSH_Baseline", "LH_Baseline", "E2_Baseline", "PRL_Baseline",
+    "Uterine_Factors", "Tubal_Factors", "Ovarian_Factors", "Ovulatory_Factors",
+    "Cervical_Factors", "Endometriosis_Factors", "Multisystem_Factors",
+    "Gynecological_Surgical_History",
+    "Alcohol", "Smoke",
+    "First_Volume", "First_Count", "First_Motile", "First_Progressive_Motile",
+    "First_Normal_Morpho",
+    "Total_Female_Pathology", "BMI_InfertilityType_Interaction",
+    "First_TPMSC", "Age_FSH_Interaction",
+]
+
+# =============================
+# Pregnancy Probability Tier cutoffs — 2-TIER (Low vs High)
+#
+# NOTE: Originally 3-tier (Low/Intermediate/High), percentile 33rd/67th.
+# An earlier seed-sensitivity analysis (run on the earlier XGBoost
+# Procedure-Day model) showed overlapping, unstable Intermediate/High
+# tiers; that finding is not used to justify the current CatBoost scheme.
+# Both models now use 2 tiers (median split, 50th percentile on the
+# calibration set) for simple descriptive risk communication -- see the
+# tier cells in model_training.ipynb and first_visit_model.ipynb.
+#
+# Cutoffs are loaded from each notebook's manifest JSON at full precision
+# (not hand-copied/rounded), since isotonic ties can sit exactly on a
+# rounded cutoff and be misclassified by assign_tier()'s <= rule.
+# =============================
+def _load_tier_cutoff_from_manifest(manifest_path, key_candidates, model_label):
+    if not manifest_path.exists():
+        raise FileNotFoundError(
+            f"{model_label} tier manifest not found at {manifest_path}. Run the "
+            "corresponding notebook's tier-analysis cell (which saves this manifest) "
+            "before running this app -- the cutoff must not be hardcoded here, since "
+            "isotonic calibration can place many patients exactly at the cutoff value "
+            "and a rounded/stale literal can misclassify them."
+        )
+    with open(manifest_path, "r", encoding="utf-8") as f:
+        manifest = json.load(f)
+    for key in key_candidates:
+        if key in manifest:
+            return float(manifest[key])
+    raise KeyError(
+        f"{model_label} tier manifest at {manifest_path} does not contain any of the "
+        f"expected cutoff keys {key_candidates} -- found keys: {list(manifest.keys())}. "
+        "Update key_candidates in _load_tier_cutoff_from_manifest's caller above to "
+        "match the actual manifest schema."
+    )
+
+PW_TIER_MANIFEST_PATH = PROJECT_ROOT / "reports" / "tables" / "procedure_day_manifest.json"
+FV_TIER_MANIFEST_PATH = PROJECT_ROOT / "reports" / "tables" / "first_visit_tier_manifest.json"
+
+# Confirmed key: model_training.ipynb's manifest cell saves the cutoff
+# under "tier_cutoff" (see procedure_day_manifest.json's own schema).
+PW_CUTOFF = _load_tier_cutoff_from_manifest(
+    PW_TIER_MANIFEST_PATH, ["tier_cutoff"], "Procedure-Day"
+)
+# Confirmed key: first_visit_model.ipynb's tier-manifest-saving cell
+# saves the cutoff under "cutoff" (verified against the actual
+# first_visit_tier_manifest.json schema).
+FV_CUTOFF = _load_tier_cutoff_from_manifest(
+    FV_TIER_MANIFEST_PATH, ["cutoff"], "First-Visit"
+)
+
+PW_DISPLAY_MAP = {
+    "Uterine_Factors":                 "Uterine factor",
+    "Total_Female_Pathology":          "Total female pathology score",
+    "Menstrual_Interval_Days":         "Menstrual cycle length (days)",
+    "Gynecological_Surgical_History":  "Prior gynecologic surgery",
+    "Post_TPMSC":                      "Postwash TPMSC (million)",
+    "Post_Count":                      "Postwash sperm count (\u00d710\u2076/mL)",
+    "First_Count":                     "Initial sperm concentration (\u00d710\u2076/mL)",
+    "First_Progressive_Motile":        "Initial progressive motility (%)",
+    "Age_Female":                      "Female age (years)",
+    "Ratio_TPMSC":                     "Postwash-to-prewash TPMSC ratio",
+    "Age_FSH_Interaction":             "Age \u00d7 baseline FSH",
+}
+
+FV_DISPLAY_MAP = {
+    "Age_Female":                      "Female age (years)",
+    "Age_Male":                        "Male age (years)",
+    "Body_Mass_Index":                 "BMI (kg/m\u00b2)",
+    "Total_infertile_duration":        "Infertility duration (months)",
+    "Infertility_Type":                "Infertility type",
+    "Pregnancy_History":               "Number of prior pregnancies",
+    "Number_Of_Alive_Children":        "Number of living children",
+    "Number_Of_Miscarriages":          "Number of miscarriages",
+    "Menstrual":                       "Menstrual regularity",
+    "Menstrual_Interval_Days":         "Menstrual cycle length (days)",
+    "Menstrual_Duration_Days":         "Menstrual bleeding duration (days)",
+    "Dysmenorrhea":                    "Dysmenorrhea severity",
+    "FSH_Baseline":                    "Baseline FSH (mIU/mL)",
+    "LH_Baseline":                     "Baseline LH (mIU/mL)",
+    "E2_Baseline":                     "Baseline E2 (pg/mL)",
+    "PRL_Baseline":                    "Baseline prolactin (ng/mL)",
+    "Uterine_Factors":                 "Uterine factor",
+    "Tubal_Factors":                   "Tubal factor",
+    "Ovarian_Factors":                 "Ovarian factor",
+    "Ovulatory_Factors":               "Ovulatory factor",
+    "Cervical_Factors":                "Cervical factor",
+    "Endometriosis_Factors":           "Endometriosis",
+    "Multisystem_Factors":             "Multisystem pathology",
+    "Gynecological_Surgical_History":  "Prior gynecologic surgery",
+    "Alcohol":                         "Alcohol use (male partner)",
+    "Smoke":                           "Smoking (male partner)",
+    "First_Volume":                    "Initial semen volume (mL)",
+    "First_Count":                     "Initial sperm concentration (\u00d710\u2076/mL)",
+    "First_Motile":                    "Initial total motility (%)",
+    "First_Progressive_Motile":        "Initial progressive motility (%)",
+    "First_Normal_Morpho":             "Initial normal morphology (%)",
+    "Total_Female_Pathology":          "Total female pathology score",
+    "BMI_InfertilityType_Interaction": "BMI \u00d7 infertility type",
+    "First_TPMSC":                     "Initial TPMSC (million)",
+    "Age_FSH_Interaction":             "Age \u00d7 baseline FSH",
+}
+
+# 16 raw inputs collected for the 11-feature Procedure-Day model (11
+# features are derived from these via compute_pw_features()). 7 pathology
+# factors are collected (shared form layout with First-Visit), but only
+# 6 feed Total_Female_Pathology -- Multisystem_Factors is collected but
+# not summed (see PATHOLOGY_COLS).
+PW_REQUIRED_RAW = [
+    "Uterine_Factors", "Tubal_Factors", "Ovarian_Factors",
+    "Ovulatory_Factors", "Cervical_Factors", "Endometriosis_Factors",
+    "Multisystem_Factors",
+    "Gynecological_Surgical_History",
+    "Menstrual_Interval_Days",
+    "First_Count", "First_Progressive_Motile",
+    "Post_TPMSC", "Post_Count",
+    "Pre_TPMSC",
+    "Age_Female",
+    "FSH_Baseline",
+]
+
+# Full 31 raw inputs required for the Full35 First-Visit feature set.
+FV_REQUIRED_RAW = [
+    "Age_Female", "Age_Male", "Body_Mass_Index", "Total_infertile_duration",
+    "Infertility_Type", "Pregnancy_History", "Number_Of_Alive_Children",
+    "Number_Of_Miscarriages",
+    "Menstrual", "Menstrual_Interval_Days", "Menstrual_Duration_Days", "Dysmenorrhea",
+    "FSH_Baseline", "LH_Baseline", "E2_Baseline", "PRL_Baseline",
+    "Uterine_Factors", "Tubal_Factors", "Ovarian_Factors", "Ovulatory_Factors",
+    "Cervical_Factors", "Endometriosis_Factors", "Multisystem_Factors",
+    "Gynecological_Surgical_History",
+    "Alcohol", "Smoke",
+    "First_Volume", "First_Count", "First_Motile", "First_Progressive_Motile",
+    "First_Normal_Morpho",
+]
+
+# Display defaults for the manual-entry form only -- actual imputation
+# uses the fitted PW_IMPUTER_PATH. Values are raw-data medians from
+# data/raw/final_coding.xlsx (n=3,161 records, pre-cleaning).
+PW_MEDIANS = {
+    "Uterine_Factors": 0.0, "Tubal_Factors": 0.0, "Ovarian_Factors": 0.0,
+    "Ovulatory_Factors": 0.0, "Cervical_Factors": 0.0,
+    "Endometriosis_Factors": 0.0, "Multisystem_Factors": 0.0,
+    "Gynecological_Surgical_History": 0.0,
+    "Menstrual_Interval_Days": 29.0,
+    "First_Count": 41.31, "First_Progressive_Motile": 52.56,
+    "Post_TPMSC": 10.70, "Post_Count": 22.2,
+    "Pre_TPMSC": 49.11,
+    "Age_Female": 35.0,
+    "FSH_Baseline": 6.88,
+}
+
+FV_MEDIANS = {
+    "Age_Female": 35.0, "Age_Male": 36.0,
+    "Body_Mass_Index": 21.718066,
+    "Total_infertile_duration": 36.0,
+    "Infertility_Type": 0.0,
+    "Pregnancy_History": 0.0,
+    "Number_Of_Alive_Children": 0.0,
+    "Number_Of_Miscarriages": 0.0,
+    "Menstrual": 0.0,  # 0=Regular, 1=Irregular
+    "Menstrual_Interval_Days": 29.0,
+    "Menstrual_Duration_Days": 4.0,
+    "Dysmenorrhea": 1.0,  # 0=No,1=Mild,2=Moderate,3=Severe
+    "FSH_Baseline": 6.88, "LH_Baseline": 5.72, "E2_Baseline": 36.6, "PRL_Baseline": 19.8,
+    "Uterine_Factors": 0.0, "Tubal_Factors": 0.0, "Ovarian_Factors": 0.0,
+    "Ovulatory_Factors": 0.0, "Cervical_Factors": 0.0,
+    "Endometriosis_Factors": 0.0, "Multisystem_Factors": 0.0,
+    "Gynecological_Surgical_History": 0.0,
+    "Alcohol": 0.0, "Smoke": 0.0,  # 4-level ordinal (0-3) each
+    "First_Volume": 3.0, "First_Count": 41.31,
+    "First_Motile": 54.7,
+    "First_Progressive_Motile": 52.56,
+    "First_Normal_Morpho": 5.0,
+}
+
+# Alcohol / Smoke are 4-level ordinal scales (NOT binary) -- verified
+# against final_coding.xlsx (Alcohol: 0=2075, 1=510, 2=199, 3=377;
+# Smoke: 0=2620, 1=329, 2=158, 3=53) and against the project's
+# feature-meaning reference document's coding tables:
+ALCOHOL_LABELS = {
+    0: "Non-drinker / minimal (<1 unit/week)",
+    1: "Low-risk drinker (1\u20137 units/week)",
+    2: "Increasing-risk drinker (8\u201314 units/week)",
+    3: "Higher-risk drinker (>14 units/week)",
+}
+SMOKE_LABELS = {
+    0: "Non-smoker",
+    1: "Mild smoker (1\u20139 cigarettes/day)",
+    2: "Moderate smoker (10\u201319 cigarettes/day)",
+    3: "Heavy smoker (\u226520 cigarettes/day)",
+}
+
+VALIDATION_RULES = {
+    "Age_Female":               (18, 55),
+    "Age_Male":                 (18, 65),
+    "Body_Mass_Index":          (10, 60),
+    "Menstrual_Interval_Days":  (15, 180),
+    "Menstrual_Duration_Days":  (0, 31),
+    "First_Volume":             (0, 20),
+    "First_Count":              (0, 500),
+    "First_Motile":             (0, 100),
+    "First_Progressive_Motile": (0, 100),
+    "First_Normal_Morpho":      (0, 100),
+    "Pre_Count":                (0, 500),
+    "Pre_Motile":               (0, 100),
+    "Pre_Progressive_Motile":   (0, 100),
+    "Pre_TPMSC":                (0, 700),
+    "Post_Count":               (0, 500),
+    "Post_TPMSC":               (0, 500),
+    "Post_Motile":              (0, 100),
+    "Post_Progressive_Motile":  (0, 100),
+    "FSH_Baseline":             (0, 40),
+    "LH_Baseline":              (0, 30),
+    "E2_Baseline":              (0, 300),
+    "PRL_Baseline":             (0, 150),
+    "Dysmenorrhea":             (0, 3),
+    "Menstrual":                (0, 1),
+    "Infertility_Type":         (0, 1),
+    "Alcohol":                  (0, 3),
+    "Smoke":                    (0, 3),
+    "Gynecological_Surgical_History": (0, 1),
+    "Total_infertile_duration": (0, 360),
+    "Pregnancy_History":        (0, 8),
+    "Number_Of_Alive_Children": (0, 5),
+    "Number_Of_Miscarriages":   (0, 6),
+}
+
+# Page config + CSS
+# =============================
+st.set_page_config(
+    page_title="IUI Pregnancy Probability Tool",
+    layout="wide",
+    initial_sidebar_state="expanded"
+)
+
+st.markdown("""
+<style>
+@import url('https://fonts.googleapis.com/css2?family=DM+Sans:wght@300;400;500;600&family=DM+Serif+Display&display=swap');
+html, body, [class*="css"] { font-family: 'DM Sans', sans-serif; }
+section[data-testid="stSidebar"] { background: #0f2b4a; padding-top: 2rem; }
+section[data-testid="stSidebar"] * { color: #e8f0fe !important; }
+.main { background: #f5f7fa; }
+
+.risk-low  { background:#fff5f5; border:2px solid #fc8181; border-radius:20px; padding:2rem 2.5rem; text-align:center; margin-bottom:1rem; }
+.risk-high { background:#f0fff4; border:2px solid #68d391; border-radius:20px; padding:2rem 2.5rem; text-align:center; margin-bottom:1rem; }
+.risk-group-label { font-size:0.82rem; font-weight:600; text-transform:uppercase; letter-spacing:0.1em; margin-bottom:0.4rem; }
+.risk-group-label-low  { color:#c53030; }
+.risk-group-label-high { color:#276749; }
+.risk-prob { font-family:'DM Serif Display',serif; font-size:4rem; line-height:1; margin:0.4rem 0; }
+.risk-prob-low  { color:#c53030; }
+.risk-prob-high { color:#276749; }
+.risk-sub { font-size:0.85rem; color:#718096; }
+
+.prob-bar-wrap { margin:1rem 0 1.8rem; position:relative; height:12px; background:#e2e8f0; border-radius:8px; }
+.prob-bar-fill { height:12px; border-radius:8px; }
+.prob-bar-fill-low  { background:linear-gradient(90deg,#fed7d7,#fc8181); }
+.prob-bar-fill-high { background:linear-gradient(90deg,#c6f6d5,#68d391); }
+.tier-marker { position:absolute; top:-6px; width:2px; height:24px; background:#94a3b8; }
+.tier-marker-label { position:absolute; top:22px; font-size:0.62rem; color:#94a3b8; transform:translateX(-50%); white-space:nowrap; }
+
+.dot-grid { display:flex; flex-wrap:wrap; gap:3px; margin:0.5rem 0; max-width:340px; }
+.dot { width:10px; height:10px; border-radius:50%; }
+.dot-active-low  { background:#fc8181; }
+.dot-active-high { background:#68d391; }
+.dot-inactive { background:#e2e8f0; }
+
+.badge-pw { display:inline-block; background:#e3f2fd; color:#0d47a1; border-radius:8px; padding:0.2rem 0.8rem; font-size:0.8rem; font-weight:600; }
+.badge-fv { display:inline-block; background:#e8f5e9; color:#1b5e20; border-radius:8px; padding:0.2rem 0.8rem; font-size:0.8rem; font-weight:600; }
+.info-card { background:white; border-radius:16px; padding:1.5rem 2rem; box-shadow:0 2px 12px rgba(15,43,74,0.07); margin-bottom:1rem; }
+.info-card h3 { font-family:'DM Serif Display',serif; color:#0f2b4a; font-size:1.05rem; margin-bottom:0.5rem; }
+.section-header { font-family:'DM Serif Display',serif; color:#0f2b4a; font-size:1.3rem; border-bottom:2px solid #e3eafc; padding-bottom:0.4rem; margin:1.5rem 0 1rem; }
+.form-group-label { font-size:0.8rem; font-weight:600; color:#1565c0; text-transform:uppercase; letter-spacing:0.08em; margin:1.2rem 0 0.4rem; }
+
+.factors-card { background:white; border-radius:16px; padding:1.5rem 2rem; box-shadow:0 2px 12px rgba(15,43,74,0.07); margin-bottom:1rem; }
+.factor-group-title { font-size:0.82rem; font-weight:600; text-transform:uppercase; letter-spacing:0.08em; margin-bottom:1rem; padding-bottom:0.4rem; border-bottom:1px solid #f1f5f9; }
+.factor-group-against { color:#c53030; }
+.factor-group-favor   { color:#276749; }
+.factor-row { display:flex; align-items:center; margin-bottom:0.9rem; gap:1rem; }
+.factor-name { flex:0 0 220px; font-size:0.88rem; color:#2d3748; }
+.factor-bar-bg { flex:1; background:#f1f5f9; border-radius:6px; height:8px; overflow:hidden; }
+.factor-bar-against { height:8px; border-radius:6px; background:#fc8181; }
+.factor-bar-favor   { height:8px; border-radius:6px; background:#68d391; }
+.factor-label { flex:0 0 65px; font-size:0.78rem; color:#94a3b8; text-align:right; }
+
+.cycle-card { background:white; border-radius:12px; padding:1rem 1.5rem; box-shadow:0 2px 8px rgba(15,43,74,0.07); margin-bottom:0.5rem; border-left:4px solid #e2e8f0; }
+.cycle-card-low  { border-left-color:#fc8181; }
+.cycle-card-high { border-left-color:#68d391; }
+
+.val-warn { background:#fff3cd; border:1px solid #ffc107; border-radius:8px; padding:0.6rem 1rem; font-size:0.84rem; color:#856404; margin-bottom:0.5rem; }
+.disclaimer { background:#fff8e1; border-radius:12px; padding:0.8rem 1.2rem; color:#744210; font-size:0.82rem; line-height:1.6; margin-top:1rem; }
+#MainMenu, footer { visibility:hidden; }
+</style>
+""", unsafe_allow_html=True)
+
+# =============================
+# Session state
+# =============================
+if "cycle_history" not in st.session_state:
+    st.session_state.cycle_history = []
+
+# =============================
+# Core helpers
+# =============================
+# Streamlit Community Cloud servers run on UTC; show Thai local time
+# (UTC+7, no daylight saving) in reports, file names and history.
+TH_TZ = timezone(timedelta(hours=7))
+
+def now_th():
+    return datetime.now(TH_TZ)
+
+def sigmoid(z):
+    return 1.0 / (1.0 + np.exp(-z))
+
+# Display bounds for calibrated probabilities. Isotonic regression fitted on
+# a small calibration set (42 pregnancies) can output exactly 0 or 1 at the
+# extremes, which are not clinically plausible per-cycle estimates. The raw
+# calibrated value is still used for tier assignment; only the displayed
+# number is bounded.
+PROB_DISPLAY_MIN = 0.01
+PROB_DISPLAY_MAX = 0.30
+
+def fmt_prob(p):
+    if p < PROB_DISPLAY_MIN:
+        return f"<{PROB_DISPLAY_MIN:.0%}"
+    if p > PROB_DISPLAY_MAX:
+        return f">{PROB_DISPLAY_MAX:.0%}"
+    return f"{p:.1%}"
+
+def fmt_prob_html(p):
+    # Escaped version for HTML/ReportLab contexts ("<1%" -> "&lt;1%").
+    return fmt_prob(p).replace("<", "&lt;").replace(">", "&gt;")
+
+def assign_tier(p_cal, model_type="postwash"):
+    """
+    2-tier assignment (Low / High), based on a single median-split cutoff
+    computed on the calibration set for each model. See PW_CUTOFF / FV_CUTOFF
+    above for provenance.
+    """
+    if model_type == "postwash":
+        cutoff = PW_CUTOFF
+        # FIX: corrected to match the actual TEST-SET tier summary printed
+        # by model_training.ipynb's tier cell (Low n=318, 11 pregnancies,
+        # observed rate 3.46%; High n=279, 30 pregnancies, observed rate
+        # 10.75%) -- the previous comment cited n=306/2.9% and n=291/11.0%,
+        # which do not match that cell's actual output.
+        low_obs, low_n = "about 3 in 100", 3
+        high_obs, high_n = "about 11 in 100", 11
+    else:
+        cutoff = FV_CUTOFF
+        # FIX: corrected to match the actual TEST-SET tier summary printed
+        # by first_visit_model.ipynb's tier cell (Low n=296, 10
+        # pregnancies, observed rate 3.4%; High n=301, 31 pregnancies,
+        # observed rate 10.3%) -- the previous comment cited n=396/5.3%
+        # and n=201/10.0%, and low_n was set to 5 accordingly, which
+        # overstated the Low-tier observed rate (actual ~3 in 100, not 5).
+        low_obs, low_n = "about 3 in 100", 3
+        high_obs, high_n = "about 10 in 100", 10
+
+    # p_cal == cutoff falls into Low (matches each notebook's
+    # pd.cut(right=True) boundary and manifest boundary_rule); ties are
+    # common since isotonic regression yields only ~7-16 unique values.
+    if p_cal <= cutoff:
+        return "🔴 Low Probability", "low", low_obs, low_n
+    return "🟢 High Probability", "high", high_obs, high_n
+
+def get_display_name(raw_name, model_type="postwash"):
+    dm = PW_DISPLAY_MAP if model_type == "postwash" else FV_DISPLAY_MAP
+    return dm.get(str(raw_name), str(raw_name).replace("_", " "))
+
+@st.cache_resource
+def load_model(model_type="postwash"):
+    if model_type == "postwash":
+        return joblib.load(PW_BASE_MODEL_PATH), joblib.load(PW_CALIBRATOR_PATH)
+    return joblib.load(FV_BASE_MODEL_PATH), joblib.load(FV_CALIBRATOR_PATH)
+
+@st.cache_resource
+def load_pw_imputer():
+    return joblib.load(PW_IMPUTER_PATH)
+
+@st.cache_resource
+def load_fv_imputer():
+    return joblib.load(FV_IMPUTER_PATH)
+
+def validate_inputs(raw_inputs):
+    # Warnings apply per VALIDATION_RULES' own [lo, hi] bounds rather
+    # than blanket-exempting val=0, so a 0 in a field where 0 is invalid
+    # (e.g. Age_Female) still warns.
+    warnings = []
+    for field, (lo, hi) in VALIDATION_RULES.items():
+        val = raw_inputs.get(field)
+        if val is not None and not (lo <= val <= hi):
+            warnings.append(f"{field.replace('_', ' ')}: {val} (expected {lo}–{hi})")
+    return warnings
+
+def validate_inputs_df(df):
+    """Row-wise version of validate_inputs() for CSV batch uploads (Multiple
+    Patients / Detailed Analysis pages). The manual Single Patient form is
+    protected by validate_inputs() above via Streamlit widget bounds and an
+    inline warning banner; CSV-uploaded data has no such protection unless
+    checked here. Returns a tidy DataFrame of out-of-range values (empty if
+    none found). Fields where 0 is legitimate (e.g. sperm count in
+    azoospermia) already have lo=0 in VALIDATION_RULES, so they never
+    trigger a warning for val=0 -- no separate "0 is never flagged"
+    exemption is needed (see the FIX note in validate_inputs() above).
+    """
+    rows = []
+    for field, (lo, hi) in VALIDATION_RULES.items():
+        if field not in df.columns:
+            continue
+        vals = pd.to_numeric(df[field], errors="coerce")
+        out_of_range = vals.notna() & ~vals.between(lo, hi)
+        for row_idx in df.index[out_of_range]:
+            rows.append({
+                "Row":            int(row_idx) + 1,
+                "Field":          field.replace("_", " "),
+                "Value":          vals.loc[row_idx],
+                "Expected range": f"{lo}–{hi}",
+            })
+    return pd.DataFrame(rows, columns=["Row", "Field", "Value", "Expected range"])
+
+def render_batch_validation_warnings(df_raw):
+    """Show a dismissible warning + detail table if any row in a batch upload
+    has out-of-range values. Does not block processing — mirrors the
+    non-blocking behaviour of the Single Patient form."""
+    warn_df = validate_inputs_df(df_raw)
+    if not warn_df.empty:
+        n_rows = warn_df["Row"].nunique()
+        st.markdown(
+            f'<div class="val-warn">⚠️ {len(warn_df)} out-of-range value(s) found '
+            f'across {n_rows} row(s). These rows will still be processed using the '
+            f'values as entered — please double-check for data-entry errors.</div>',
+            unsafe_allow_html=True
+        )
+        with st.expander("Show out-of-range values"):
+            st.dataframe(warn_df, use_container_width=True, hide_index=True)
+    return warn_df
+
+def compute_pw_features(df_raw):
+    # Computes only the engineered features PW_FEATURES needs
+    # (Total_Female_Pathology, Age_FSH_Interaction, Ratio_TPMSC); missing
+    # raw values are imputed once at the end via the fitted Subtrain imputer.
+    df = df_raw.copy()
+    missing = [c for c in PW_REQUIRED_RAW if c not in df.columns]
+    if missing:
+        raise ValueError("Missing required columns:\n- " + "\n- ".join(missing))
+    for c in PW_REQUIRED_RAW:
+        df[c] = pd.to_numeric(df[c], errors="coerce")
+
+    # .sum(axis=1, min_count=1) matches feature_engineering.py: sums
+    # whatever pathology columns are present, only NaN if all are missing.
+    df["Total_Female_Pathology"] = df[PATHOLOGY_COLS].sum(axis=1, min_count=1)
+    df["Age_FSH_Interaction"] = df["Age_Female"] * df["FSH_Baseline"]
+    # Ratio_TPMSC: Post_TPMSC / Pre_TPMSC, clipped to [0, 10], matching
+    # feature_engineering.py's add_sperm_wash_features() exactly --
+    # undefined (NaN, later imputed) when Pre_TPMSC is not positive.
+    df["Ratio_TPMSC"] = np.where(
+        df["Pre_TPMSC"] > 0, df["Post_TPMSC"] / df["Pre_TPMSC"], np.nan
+    )
+    df["Ratio_TPMSC"] = df["Ratio_TPMSC"].clip(0, 10)
+
+    X = df[PW_FEATURES].copy()
+    na_cols = [c for c in PW_FEATURES if X[c].isna().any()]
+    if na_cols:
+        imputer = load_pw_imputer()
+        X = pd.DataFrame(imputer.transform(X), columns=PW_FEATURES, index=X.index)
+        st.info(f"\u2139\ufe0f Missing values imputed with training-set (Subtrain) median for: {', '.join(na_cols)}")
+    return X
+
+def compute_fv_features(df_raw):
+    # Missing raw inputs stay NaN through feature engineering and are
+    # imputed once via the fitted first_visit_imputer.joblib (not
+    # FV_MEDIANS, which is a display default only). Includes
+    # Age_FSH_Interaction, matching FIRST_VISIT_FEATURES exactly.
+    df = df_raw.copy()
+    missing = [c for c in FV_REQUIRED_RAW if c not in df.columns]
+    if missing:
+        raise ValueError("Missing required columns:\n- " + "\n- ".join(missing))
+    for c in FV_REQUIRED_RAW:
+        df[c] = pd.to_numeric(df[c], errors="coerce")
+    # FIX (same as compute_pw_features): use .sum(min_count=1) instead of
+    # direct addition, matching feature_engineering.py's own
+    # add_female_interaction_features() -- a single missing pathology
+    # column no longer blanks out the whole score.
+    df["Total_Female_Pathology"] = df[PATHOLOGY_COLS].sum(axis=1, min_count=1)
+    df["BMI_InfertilityType_Interaction"] = df["Body_Mass_Index"] * df["Infertility_Type"]
+    df["First_TPMSC"]                     = (df["First_Volume"] * df["First_Count"] * df["First_Progressive_Motile"] / 100).clip(upper=200)
+    df["Age_FSH_Interaction"] = df["Age_Female"] * df["FSH_Baseline"]
+
+    X = df[FV_FEATURES].copy()
+    na_cols = [c for c in FV_FEATURES if X[c].isna().any()]
+    if na_cols:
+        imputer = load_fv_imputer()
+        X = pd.DataFrame(imputer.transform(X), columns=FV_FEATURES, index=X.index)
+        st.info(f"\u2139\ufe0f Missing values imputed with training-set (Subtrain) median for: {', '.join(na_cols)}")
+    return X
+
+def predict(X, model_type="postwash"):
+    model, calibrator = load_model(model_type)
+    return np.clip(calibrator.predict(model.predict_proba(X)[:, 1]), 0, 1)
+
+# Patient-specific value labels for the influencing-factors list, so that
+# e.g. "Uterine factor: No" under "Increasing" is not misread as the
+# uterine factor itself raising the estimate. Plain ASCII/WinAnsi units
+# only (no superscripts), since the PDF uses the built-in Helvetica font.
+def _yes_no(v):
+    return "Yes" if round(float(v)) == 1 else "No"
+
+def _num(fmt, unit=""):
+    sep = "" if unit == "%" else " "
+    return lambda v, row: (fmt.format(float(v)) + (f"{sep}{unit}" if unit else ""))
+
+_ORDINAL = {
+    "Dysmenorrhea": {0: "None", 1: "Mild", 2: "Moderate", 3: "Severe"},
+    "Alcohol": {0: "Non-drinker/minimal", 1: "Low-risk", 2: "Increasing-risk", 3: "Higher-risk"},
+    "Smoke": {0: "Non-smoker", 1: "Mild", 2: "Moderate", 3: "Heavy"},
+    "Menstrual": {0: "Regular", 1: "Irregular"},
+    "Infertility_Type": {0: "Primary", 1: "Secondary"},
+}
+
+def _ordinal(feature):
+    return lambda v, row: _ORDINAL[feature].get(int(round(float(v))), f"{float(v):g}")
+
+def _age_fsh(v, row):
+    age = float(row["Age_Female"]) if "Age_Female" in row else None
+    if "FSH_Baseline" in row:
+        fsh = float(row["FSH_Baseline"])
+    elif age:
+        fsh = float(v) / age
+    else:
+        return f"{float(v):.1f}"
+    return f"age {age:.0f} y, FSH {fsh:.1f} IU/L" if age is not None else f"{float(v):.1f}"
+
+def _bmi_type(v, row):
+    if "Body_Mass_Index" in row and "Infertility_Type" in row:
+        t = _ORDINAL["Infertility_Type"].get(int(round(float(row["Infertility_Type"]))), "")
+        return f"BMI {float(row['Body_Mass_Index']):.1f}, {t}"
+    return f"{float(v):.1f}"
+
+FACTOR_VALUE_FORMAT = {
+    "Uterine_Factors":                 ("Uterine factor", lambda v, row: _yes_no(v)),
+    "Tubal_Factors":                   ("Tubal factor", lambda v, row: _yes_no(v)),
+    "Ovarian_Factors":                 ("Ovarian factor", lambda v, row: _yes_no(v)),
+    "Ovulatory_Factors":               ("Ovulatory factor", lambda v, row: _yes_no(v)),
+    "Cervical_Factors":                ("Cervical factor", lambda v, row: _yes_no(v)),
+    "Endometriosis_Factors":           ("Endometriosis", lambda v, row: _yes_no(v)),
+    "Multisystem_Factors":             ("Multisystem pathology", lambda v, row: _yes_no(v)),
+    "Gynecological_Surgical_History":  ("Prior gynecologic surgery", lambda v, row: _yes_no(v)),
+    "Total_Female_Pathology":          ("Total female pathology score", _num("{:.0f}")),
+    "Age_Female":                      ("Female age", _num("{:.0f}", "years")),
+    "Age_Male":                        ("Male age", _num("{:.0f}", "years")),
+    "Body_Mass_Index":                 ("BMI", _num("{:.1f}", "kg/m2")),
+    "Total_infertile_duration":        ("Infertility duration", _num("{:.0f}", "months")),
+    "Infertility_Type":                ("Infertility type", _ordinal("Infertility_Type")),
+    "Pregnancy_History":               ("Prior pregnancies", _num("{:.0f}")),
+    "Number_Of_Alive_Children":        ("Living children", _num("{:.0f}")),
+    "Number_Of_Miscarriages":          ("Miscarriages", _num("{:.0f}")),
+    "Menstrual":                       ("Menstrual regularity", _ordinal("Menstrual")),
+    "Menstrual_Interval_Days":         ("Menstrual cycle length", _num("{:.0f}", "days")),
+    "Menstrual_Duration_Days":         ("Menstrual bleeding duration", _num("{:.0f}", "days")),
+    "Dysmenorrhea":                    ("Dysmenorrhea", _ordinal("Dysmenorrhea")),
+    "FSH_Baseline":                    ("Baseline FSH", _num("{:.1f}", "IU/L")),
+    "LH_Baseline":                     ("Baseline LH", _num("{:.1f}", "mIU/mL")),
+    "E2_Baseline":                     ("Baseline E2", _num("{:.1f}", "pg/mL")),
+    "PRL_Baseline":                    ("Baseline prolactin", _num("{:.1f}", "ng/mL")),
+    "Alcohol":                         ("Alcohol use (male partner)", _ordinal("Alcohol")),
+    "Smoke":                           ("Smoking (male partner)", _ordinal("Smoke")),
+    "First_Volume":                    ("Initial semen volume", _num("{:.1f}", "mL")),
+    "First_Count":                     ("Initial sperm concentration", _num("{:.1f}", "million/mL")),
+    "First_Motile":                    ("Initial total motility", _num("{:.1f}", "%")),
+    "First_Progressive_Motile":        ("Initial progressive motility", _num("{:.1f}", "%")),
+    "First_Normal_Morpho":             ("Initial normal morphology", _num("{:.1f}", "%")),
+    "First_TPMSC":                     ("Initial TPMSC", _num("{:.1f}", "million")),
+    "Post_TPMSC":                      ("Postwash TPMSC", _num("{:.1f}", "million")),
+    "Post_Count":                      ("Postwash sperm count", _num("{:.1f}", "million/mL")),
+    "Ratio_TPMSC":                     ("Postwash-to-prewash TPMSC ratio", _num("{:.2f}")),
+    "Age_FSH_Interaction":             ("Age \u00d7 baseline FSH", _age_fsh),
+    "BMI_InfertilityType_Interaction": ("BMI \u00d7 infertility type", _bmi_type),
+}
+
+def factor_name_with_value(feature, X_row, model_type):
+    row = X_row.iloc[0]
+    if feature in FACTOR_VALUE_FORMAT:
+        label, fmt = FACTOR_VALUE_FORMAT[feature]
+        try:
+            return f"{label}: {fmt(row[feature], row)}"
+        except Exception:
+            return label
+    return get_display_name(feature, model_type)
+
+FACTOR_DIRECTION_NOTE = (
+    "Direction refers to this patient's value \u2014 e.g., having no uterine factor "
+    "raises the estimate."
+)
+
+def get_factors(X_row, model_type="postwash", top_k=5):
+    # Strength/label are computed from abs(SHAP value) directly
+    # (order-independent), not a cumulative probability-space delta that
+    # could shift with stacking order. "delta" is kept only for the
+    # displayed percentage and its +/- sign (against/favor split).
+    model, _ = load_model(model_type)
+    xgb = model.named_steps["model"] if hasattr(model, "named_steps") else model
+    explainer = shap.TreeExplainer(xgb)
+    shap_vals = explainer.shap_values(X_row)
+    if isinstance(shap_vals, list): shap_vals = shap_vals[1]
+    if shap_vals.ndim == 3:         shap_vals = shap_vals[:, :, 1]
+    sv   = shap_vals.reshape(-1)
+    base = explainer.expected_value
+    if isinstance(base, (list, np.ndarray)):
+        base = base[1] if len(np.ravel(base)) >= 2 else float(np.ravel(base)[0])
+    z, items = float(base), []
+    for j in np.argsort(np.abs(sv))[::-1]:
+        dz       = float(sv[j])
+        p_before = sigmoid(z); z += dz; p_after = sigmoid(z)
+        items.append({
+            "name": factor_name_with_value(X_row.columns[j], X_row, model_type),
+            "delta": (p_after - p_before) * 100.0,
+            "abs_shap": abs(dz),
+        })
+    against = [x for x in items if x["delta"] < 0][:top_k]
+    favor   = [x for x in items if x["delta"] > 0][:top_k]
+    # Strength labels use one shared max abs(SHAP) across both
+    # against/favor lists (not each list's own max), so labels are
+    # comparable across sides.
+    shared_max = max([x["abs_shap"] for x in (against + favor)], default=0)
+    def normalize(lst):
+        if not lst: return lst
+        for x in lst:
+            x["strength"] = x["abs_shap"] / shared_max if shared_max > 0 else 0
+            x["label"] = "Strong" if x["strength"] > 0.66 else "Moderate" if x["strength"] > 0.33 else "Mild"
+        return lst
+    return normalize(against), normalize(favor)
+
+# =============================
+# Render helpers
+# =============================
+def render_prob_bar(p_cal, tier_key, model_type):
+    cutoff = PW_CUTOFF if model_type == "postwash" else FV_CUTOFF
+    cap = 0.30
+    fill_pct   = min(p_cal / cap, 1.0) * 100
+    cutoff_pct = min(cutoff / cap, 1.0) * 100
+    st.markdown(f"""
+    <div style="margin:1rem 0 1.8rem;">
+        <div style="display:flex; justify-content:space-between; font-size:0.72rem; color:#94a3b8; margin-bottom:4px;">
+            <span>0%</span><span style="color:#94a3b8;">30%+</span>
+        </div>
+        <div class="prob-bar-wrap">
+            <div class="prob-bar-fill prob-bar-fill-{tier_key}" style="width:{fill_pct:.1f}%"></div>
+            <div class="tier-marker" style="left:{cutoff_pct:.1f}%"><div class="tier-marker-label">Low / High</div></div>
+        </div>
+    </div>""", unsafe_allow_html=True)
+
+def render_dot_grid(obs_n, tier_key):
+    color_hex = {"low": "#fc8181", "high": "#68d391"}[tier_key]
+    dots = "".join(
+        f'<div class="dot dot-active-{tier_key}"></div>' if i < obs_n else '<div class="dot dot-inactive"></div>'
+        for i in range(100)
+    )
+    st.markdown(f"""
+    <div style="margin:0.5rem 0 1rem;">
+        <div style="font-size:0.78rem; color:#718096; margin-bottom:0.5rem;">Out of 100 IUI cycles in this probability tier:</div>
+        <div class="dot-grid">{dots}</div>
+        <div style="font-size:0.78rem; color:#4a5568; margin-top:0.5rem;">
+            <span style="display:inline-block;width:10px;height:10px;border-radius:50%;background:{color_hex};margin-right:4px;vertical-align:middle;"></span>
+            {obs_n} of these cycles resulted in pregnancy
+        </div>
+    </div>""", unsafe_allow_html=True)
+
+def render_result(p_cal, model_type="postwash", tier_info=None):
+    # tier_info can be precomputed once by the caller and passed to both
+    # render_result() and add_to_history() to avoid a redundant
+    # assign_tier() call; defaults to None (computed here) otherwise.
+    tier_label, tier_key, obs, obs_n = tier_info if tier_info is not None else assign_tier(p_cal, model_type)
+    badge_class = "badge-pw" if model_type == "postwash" else "badge-fv"
+    badge_text  = "🔬 Procedure-Day Model" if model_type == "postwash" else "🏥 Pre-treatment Model"
+    st.markdown(f"""
+    <div class="risk-{tier_key}">
+        <div style="margin-bottom:0.8rem;"><span class="{badge_class}">{badge_text}</span></div>
+        <div class="risk-group-label risk-group-label-{tier_key}">{tier_label}</div>
+        <div class="risk-prob risk-prob-{tier_key}">{fmt_prob_html(p_cal)}</div>
+        <div class="risk-sub">estimated pregnancy probability per cycle</div>
+    </div>
+    <div class="disclaimer">
+        This estimate is intended to support clinical counseling — not to replace it.
+        Always consider the full clinical picture when discussing outcomes with your patient.
+    </div>""", unsafe_allow_html=True)
+    render_prob_bar(p_cal, tier_key, model_type)
+    render_dot_grid(obs_n, tier_key)
+
+def render_factors(against, favor):
+    col1, col2 = st.columns(2)
+    with col1:
+        if against:
+            html = '<div class="factors-card"><div class="factor-group-title factor-group-against">↓ Decreasing the base-model prediction</div>'
+            for f in against:
+                html += f'<div class="factor-row"><div class="factor-name">{f["name"]}</div><div class="factor-bar-bg"><div class="factor-bar-against" style="width:{f["strength"]*100:.0f}%"></div></div><div class="factor-label">{f["label"]}</div></div>'
+            st.markdown(html + "</div>", unsafe_allow_html=True)
+    with col2:
+        if favor:
+            html = '<div class="factors-card"><div class="factor-group-title factor-group-favor">↑ Increasing the base-model prediction</div>'
+            for f in favor:
+                html += f'<div class="factor-row"><div class="factor-name">{f["name"]}</div><div class="factor-bar-bg"><div class="factor-bar-favor" style="width:{f["strength"]*100:.0f}%"></div></div><div class="factor-label">{f["label"]}</div></div>'
+            st.markdown(html + "</div>", unsafe_allow_html=True)
+    # SHAP explains the base model's raw, pre-calibration output; deltas
+    # reflect model association, not a causal claim.
+    st.caption(
+        "Factors are specific to this patient and ranked by how strongly they influence the result. "
+        + FACTOR_DIRECTION_NOTE + " "
+        + "These reflect the model's base prediction (before probability calibration) and are "
+        "statistical associations, not confirmed causal effects."
+    )
+
+def plot_shap_waterfall(X_row, model_type="postwash"):
+    model, _ = load_model(model_type)
+    xgb = model.named_steps["model"] if hasattr(model, "named_steps") else model
+    explainer = shap.TreeExplainer(xgb)
+    exp = explainer(X_row)
+    dm  = PW_DISPLAY_MAP if model_type == "postwash" else FV_DISPLAY_MAP
+    exp.feature_names = [dm.get(c, c) for c in X_row.columns]
+    fig, _ = plt.subplots(figsize=(8, 5))
+    shap.plots.waterfall(exp[0], max_display=10, show=False)
+    plt.tight_layout()
+    return fig
+
+# =============================
+# PDF generation
+# =============================
+def generate_pdf_report(p_cal, model_type, against, favor, patient_id=""):
+    tier_label, tier_key, obs, obs_n = assign_tier(p_cal, model_type)
+    model_name = "Procedure-Day Model" if model_type == "postwash" else "Pre-treatment Model"
+    tier_color  = {"low": colors.HexColor("#c53030"), "high": colors.HexColor("#276749")}[tier_key]
+    tier_bg     = {"low": colors.HexColor("#fff5f5"), "high": colors.HexColor("#f0fff4")}[tier_key]
+    tier_border = {"low": colors.HexColor("#fc8181"), "high": colors.HexColor("#68d391")}[tier_key]
+
+    buf = io.BytesIO()
+    doc = SimpleDocTemplate(buf, pagesize=A4, leftMargin=2*cm, rightMargin=2*cm, topMargin=2*cm, bottomMargin=2*cm)
+
+    title_s   = ParagraphStyle("t",  fontName="Helvetica-Bold",    fontSize=16, leading=20, textColor=colors.HexColor("#0f2b4a"), spaceAfter=4)
+    sub_s     = ParagraphStyle("s",  fontName="Helvetica",         fontSize=9,  textColor=colors.HexColor("#718096"), spaceAfter=12)
+    heading_s = ParagraphStyle("h",  fontName="Helvetica-Bold",    fontSize=10, textColor=colors.HexColor("#0f2b4a"), spaceBefore=12, spaceAfter=4)
+    body_s    = ParagraphStyle("b",  fontName="Helvetica",         fontSize=9,  textColor=colors.HexColor("#4a5568"), spaceAfter=3)
+    disc_s    = ParagraphStyle("d",  fontName="Helvetica-Oblique", fontSize=7.5, textColor=colors.HexColor("#92400e"))
+    tier_s    = ParagraphStyle("tl", fontName="Helvetica-Bold",    fontSize=9,  textColor=tier_color)
+    # Helvetica cannot render the emoji used in the on-screen tier label
+    # (it prints as a blank box in the PDF), so strip it here.
+    tier_label_pdf = tier_label.split(" ", 1)[-1]
+    prob_s    = ParagraphStyle("pp", fontName="Helvetica-Bold",    fontSize=28, textColor=tier_color, alignment=TA_RIGHT)
+    co_s      = ParagraphStyle("co", fontName="Helvetica",         fontSize=8,  textColor=colors.HexColor("#4a5568"), alignment=TA_RIGHT)
+    ps_s      = ParagraphStyle("ps", fontName="Helvetica",         fontSize=8,  textColor=colors.HexColor("#718096"))
+
+    story = [
+        Paragraph("IUI Pregnancy Probability Report", title_s),
+        Paragraph(f"Generated {now_th().strftime('%d %B %Y, %H:%M')} (UTC+7)  |  {model_name}  |  Research application", sub_s),
+        HRFlowable(width="100%", thickness=1, color=colors.HexColor("#e3eafc"), spaceAfter=12),
+    ]
+    if patient_id:
+        story += [Paragraph(f"Patient / Cycle reference: {patient_id}", body_s), Spacer(1, 6)]
+
+    result_table = Table([
+        [Paragraph(f"<b>{tier_label_pdf}</b>", tier_s), Paragraph(f"<b>{fmt_prob_html(p_cal)}</b>", prob_s)],
+        [Paragraph("estimated pregnancy probability per cycle", ps_s),
+         Paragraph(f"Among IUI cycles in this probability tier: <b>{obs} resulted in pregnancy</b>", co_s)],
+    ], colWidths=[9*cm, 8*cm])
+    result_table.setStyle(TableStyle([
+        ("BACKGROUND",    (0,0),(-1,-1), tier_bg),
+        ("BOX",           (0,0),(-1,-1), 1.5, tier_border),
+        ("TOPPADDING",    (0,0),(-1,-1), 10),
+        ("BOTTOMPADDING", (0,0),(-1,-1), 10),
+        ("LEFTPADDING",   (0,0),(-1,-1), 14),
+        ("RIGHTPADDING",  (0,0),(-1,-1), 14),
+        ("VALIGN",        (0,0),(-1,-1), "MIDDLE"),
+    ]))
+    story += [result_table, Spacer(1, 14)]
+
+    if against or favor:
+        story += [Paragraph("Influencing Factors", heading_s),
+                  HRFlowable(width="100%", thickness=0.5, color=colors.HexColor("#e2e8f0"), spaceAfter=8)]
+
+    def factor_table(items, label, color):
+        rows = [[Paragraph(f"<b>{label}</b>", ParagraphStyle("fl", fontName="Helvetica-Bold", fontSize=8, textColor=color)), "", ""]]
+        for f in items:
+            rows.append([Paragraph(f["name"], body_s), Paragraph(f["label"], ParagraphStyle("ll", fontName="Helvetica", fontSize=8, textColor=colors.HexColor("#94a3b8"))), ""])
+        t = Table(rows, colWidths=[10*cm, 2.5*cm, 4.5*cm])
+        t.setStyle(TableStyle([("TOPPADDING",(0,0),(-1,-1),3),("BOTTOMPADDING",(0,0),(-1,-1),3),("LEFTPADDING",(0,0),(-1,-1),0)]))
+        return t
+
+    if against:
+        story += [factor_table(against, "Decreasing the base-model prediction", colors.HexColor("#c53030")), Spacer(1, 6)]
+    if favor:
+        story += [factor_table(favor, "Increasing the base-model prediction", colors.HexColor("#276749"))]
+    if against or favor:
+        story += [Spacer(1, 4), Paragraph(FACTOR_DIRECTION_NOTE, ps_s)]
+
+    story += [
+        Spacer(1, 16),
+        HRFlowable(width="100%", thickness=0.5, color=colors.HexColor("#e2e8f0"), spaceAfter=8),
+        Paragraph("This report is generated by a research application for academic purposes only. "
+                  "It is intended to support clinical counseling and should not be used as the sole basis for clinical decision-making. "
+                  "Outputs are statistical estimates derived from a single-center retrospective cohort at a Thai fertility center. "
+                  "External validation has not yet been performed.", disc_s),
+    ]
+    doc.build(story)
+    buf.seek(0)
+    return buf
+
+# =============================
+# Cycle history
+# =============================
+def add_to_history(p_cal, model_type, against, favor, label="", tier_info=None):
+    tier_label, tier_key, obs, obs_n = tier_info if tier_info is not None else assign_tier(p_cal, model_type)
+    entry = {
+        "label":      label or f"Cycle {len(st.session_state.cycle_history) + 1}",
+        "p_cal":      p_cal, "tier_label": tier_label, "tier_key": tier_key,
+        "model_type": model_type, "against": against, "favor": favor,
+        "timestamp":  now_th().strftime("%H:%M"),
+    }
+    if len(st.session_state.cycle_history) >= 3:
+        st.session_state.cycle_history.pop(0)
+    st.session_state.cycle_history.append(entry)
+
+def render_cycle_history():
+    if not st.session_state.cycle_history:
+        return
+    st.markdown('<div class="section-header">📈 Cycle History (this session)</div>', unsafe_allow_html=True)
+    cols = st.columns(len(st.session_state.cycle_history))
+    for col, entry in zip(cols, st.session_state.cycle_history):
+        with col:
+            badge = "🔬" if entry["model_type"] == "postwash" else "🏥"
+            prob_color = {"low": "#c53030", "high": "#276749"}[entry["tier_key"]]
+            st.markdown(f"""
+            <div class="cycle-card cycle-card-{entry['tier_key']}">
+                <div style="font-size:0.72rem; color:#94a3b8; margin-bottom:4px;">{badge} {entry['label']} · {entry['timestamp']}</div>
+                <div style="font-family:'DM Serif Display',serif; font-size:2rem; color:{prob_color};">{fmt_prob_html(entry['p_cal'])}</div>
+                <div style="font-size:0.78rem; color:#718096;">{entry['tier_label']}</div>
+            </div>""", unsafe_allow_html=True)
+
+    if len(st.session_state.cycle_history) > 1:
+        fig, ax = plt.subplots(figsize=(6, 2.5), facecolor="white")
+        ax.set_facecolor("white")
+        probs  = [min(e["p_cal"], PROB_DISPLAY_MAX) * 100 for e in st.session_state.cycle_history]
+        labels = [e["label"] for e in st.session_state.cycle_history]
+        bcolors = {"low": "#d55e00", "high": "#0072b2"}
+        ax.bar(labels, probs, color=[bcolors[e["tier_key"]] for e in st.session_state.cycle_history], width=0.5, zorder=3)
+        ax.set_ylabel("Probability (%)", fontsize=9)
+        ax.set_ylim(0, max(probs) * 1.6 + 1)
+        # The tier-cutoff reference line is drawn only when every visible
+        # history entry uses the same model, since Procedure-Day and
+        # Pre-treatment have different cutoffs.
+        model_types_in_history = {e["model_type"] for e in st.session_state.cycle_history}
+        if len(model_types_in_history) == 1:
+            ref_cutoff = PW_CUTOFF if "postwash" in model_types_in_history else FV_CUTOFF
+            ax.axhline(ref_cutoff * 100, color="#94a3b8", linestyle="--", linewidth=0.8, alpha=0.5)
+        for spine in ["top", "right"]: ax.spines[spine].set_visible(False)
+        ax.grid(axis="y", alpha=0.15)
+        plt.tight_layout()
+        st.pyplot(fig, use_container_width=True)
+        plt.close(fig)
+
+    if st.button("Clear history", key="clear_history"):
+        st.session_state.cycle_history = []
+        st.rerun()
+
+def build_pw_example():
+    # Matches PW_REQUIRED_RAW; numeric defaults are raw-data medians from
+    # data/raw/final_coding.xlsx.
+    row = {c: 0 for c in PW_REQUIRED_RAW}
+    row.update({
+        "Age_Female": 32.0,
+        "FSH_Baseline": 6.9,
+        "Menstrual_Interval_Days": 28.0,
+        "First_Count": 40.0, "First_Progressive_Motile": 40.0,
+        "Pre_TPMSC": 49.1,
+        "Post_Count": 12.0, "Post_TPMSC": 10.7,
+    })
+    return pd.DataFrame([row])
+
+def build_fv_example():
+    # Matches FV_REQUIRED_RAW for the Full35 First-Visit model; numeric
+    # defaults are raw-data medians from data/raw/final_coding.xlsx.
+    row = {c: 0 for c in FV_REQUIRED_RAW}
+    row.update({
+        "Age_Female": 32.0, "Age_Male": 36.0, "Body_Mass_Index": 22.0,
+        "Infertility_Type": 0, "Total_infertile_duration": 24.0,
+        "Menstrual_Interval_Days": 28.0, "Menstrual_Duration_Days": 4.0,
+        "Dysmenorrhea": 1,
+        "FSH_Baseline": 6.9, "LH_Baseline": 5.7, "E2_Baseline": 36.6, "PRL_Baseline": 19.8,
+        "First_Volume": 2.5, "First_Count": 40.0, "First_Motile": 54.7,
+        "First_Progressive_Motile": 40.0, "First_Normal_Morpho": 5.0,
+    })
+    return pd.DataFrame([row])
+
+# =============================
+
+# Sidebar
+# =============================
+with st.sidebar:
+    st.markdown("""
+    <div style="text-align:center; padding-bottom:1.5rem;">
+        <div style="font-size:2rem;">🔬</div>
+        <div style="font-family:'DM Serif Display',serif; font-size:1.2rem; color:white; line-height:1.3;">
+            IUI Pregnancy<br>Probability Tool
+        </div>
+        <div style="font-size:0.75rem; color:#90caf9; margin-top:0.4rem;">Research application</div>
+    </div>""", unsafe_allow_html=True)
+
+    page = st.radio("Navigation", ["✏️  Single Patient","📂  Multiple Patients","🔍  Detailed Analysis","ℹ️  About"],
+                    label_visibility="collapsed")
+    st.markdown("---")
+    st.markdown("<div style='font-size:0.78rem; color:#90caf9; margin-bottom:0.4rem;'>📥 Download CSV Templates</div>", unsafe_allow_html=True)
+    st.download_button("Procedure-Day Template", build_pw_example().to_csv(index=False).encode("utf-8"),
+                       "iui_procedure_day_template.csv","text/csv", use_container_width=True)
+    st.download_button("Pre-treatment Template", build_fv_example().to_csv(index=False).encode("utf-8"),
+                       "iui_pretreatment_template.csv","text/csv", use_container_width=True)
+    st.markdown("<div style='font-size:0.72rem; color:#90caf9; margin-top:1.5rem; line-height:1.6;'>For research use only.<br>Not a clinical decision system.</div>", unsafe_allow_html=True)
+
+# =============================
+# Pages
+# =============================
+if "Single" in page:
+    st.markdown('<div class="section-header">✏️ Single Patient Prediction</div>', unsafe_allow_html=True)
+    model_choice = st.radio("Which model would you like to use?",
+        ["🔬 Procedure-Day Model — for use on the day of IUI",
+         "🏥 Pre-treatment Model — for use before treatment starts"])
+    if "Procedure-Day" in model_choice:
+        model_type = "postwash"
+    else:
+        model_type = "first_visit"
+
+    if model_type == "postwash":
+        st.caption("Uses postwash semen results available on the day of IUI. This 11-feature model was retained as a parsimonious, near-optimal specification from feature-budget optimization (grouped cross-validation with fold-wise feature re-ranking) over a 63-feature candidate pool.")
+    else:
+        st.caption("Uses baseline clinical data and the initial semen analysis available before treatment starts.")
+
+    with st.form("manual_form"):
+        col1, col2 = st.columns(2)
+
+        # Defaults for variables not shown in model-specific forms
+        bmi = 21.7
+        infertility_type = 0
+        infertile_duration = 36.0
+        uterine_factors = tubal_factors = ovarian_factors = ovulatory_factors = 0
+        cervical_factors = endometriosis_factors = multisystem_factors = 0
+        gyn_surgery = 0
+        total_female_pathology = 0.0
+        first_volume = 3.0
+        first_count = 41.3
+        first_motile = 54.7
+        first_prog_motile = 52.6
+        first_normal_morpho = 5.0
+        pre_tpmsc = 49.1
+        post_count = 22.2
+        post_tpmsc = 10.7
+        age_male = 36.0
+        fsh_baseline = 6.9
+        lh_baseline = 5.7
+        e2_baseline = 36.6
+        prl_baseline = 19.8
+        dysmenorrhea = 1
+        alcohol = 0
+        smoke = 0
+        number_of_alive_children = 0
+        number_of_miscarriages = 0
+        pregnancy_history = 0
+        menstrual = 0
+        menstrual_duration_days = 4.0
+
+        if model_type == "postwash":
+            with col1:
+                st.markdown('<div class="form-group-label">Female Factors</div>', unsafe_allow_html=True)
+                age_female = st.number_input("Age (years)", 18.0, 55.0, 35.0, 1.0)
+                menstrual_interval_days = st.number_input("Menstrual cycle length (days)", 15.0, 180.0, 29.0, 1.0)
+                fsh_baseline = st.number_input(
+                    "Baseline FSH (IU/L)", 0.0, 40.0, 6.9, 0.1,
+                    help="Default (6.9) is the median from the cleaned, filtered analytic cohort (n=2,945 cycles)."
+                )
+
+                st.markdown('<div class="form-group-label">Female Pathology</div>', unsafe_allow_html=True)
+                uterine_factors = st.selectbox("Uterine factor", [0, 1])
+                # Sums all 6 pathology factors to match
+                # compute_pw_features(); Uterine_Factors is also a
+                # standalone selected feature, the other 6 are collected
+                # only to compute the total.
+                with st.expander("Other pathology factors (tubal, ovarian, ovulatory, cervical, endometriosis, multisystem)"):
+                    tubal_factors = st.selectbox("Tubal factor", [0, 1], key="pw_tubal")
+                    ovarian_factors = st.selectbox("Ovarian factor", [0, 1], key="pw_ovarian")
+                    ovulatory_factors = st.selectbox("Ovulatory factor", [0, 1], key="pw_ovulatory")
+                    cervical_factors = st.selectbox("Cervical factor", [0, 1], key="pw_cervical")
+                    endometriosis_factors = st.selectbox("Endometriosis", [0, 1], key="pw_endo")
+                    multisystem_factors = st.selectbox("Multisystem factor", [0, 1], key="pw_multi")
+                # Gynecological_Surgical_History is one of the 11
+                # selected Procedure-Day features and must be collected here.
+                gyn_surgery = st.selectbox("Prior gynecologic surgery", [0, 1], key="pw_gyn_surgery")
+                # Displayed total excludes Multisystem_Factors to match
+                # PATHOLOGY_COLS / compute_pw_features().
+                total_female_pathology = float(
+                    uterine_factors + tubal_factors + ovarian_factors +
+                    ovulatory_factors + cervical_factors + endometriosis_factors
+                )
+                st.caption(f"Total female pathology score: **{total_female_pathology:.0f}** (auto-computed from the six factors above; the multisystem factor is not summed and is not used by the Procedure-Day model)")
+
+            with col2:
+                st.markdown('<div class="form-group-label">Initial Semen Analysis</div>', unsafe_allow_html=True)
+                first_count = st.number_input("Sperm concentration (\u00d710\u2076/mL)", 0.0, 500.0, 41.3, 0.1, key="pw_first_count")
+                first_prog_motile = st.number_input("Progressive motility (%)", 0.0, 100.0, 52.6, 0.1, key="pw_first_prog_motile")
+
+                st.markdown('<div class="form-group-label">Prewash Semen</div>', unsafe_allow_html=True)
+                pre_tpmsc = st.number_input(
+                    "Prewash TPMSC (\u00d710\u2076)", 0.0, 700.0, 49.1, 0.1,
+                    help="Default (49.1) is the median from the cleaned, filtered analytic cohort (n=2,945 cycles)."
+                )
+
+                st.markdown('<div class="form-group-label">Postwash Semen</div>', unsafe_allow_html=True)
+                post_count = st.number_input("Postwash sperm count (\u00d710\u2076/mL)", 0.0, 500.0, 22.2, 0.1)
+                post_tpmsc = st.number_input("Postwash TPMSC (\u00d710\u2076)", 0.0, 500.0, 10.7, 0.1)
+
+        else:
+            with col1:
+                st.markdown('<div class="form-group-label">Female Factors</div>', unsafe_allow_html=True)
+                age_female = st.number_input("Age (years)", 18.0, 55.0, 35.0, 1.0)
+                age_male = st.number_input(
+                    "Male partner age (years)", 18.0, 65.0, 36.0, 1.0, key="fv_age_male"
+                )
+                bmi = st.number_input("BMI (kg/m\u00b2)", 10.0, 60.0, 21.7, 0.1)
+                infertility_type = st.selectbox("Infertility type", [0, 1],
+                    format_func=lambda x: "Primary \u2014 no prior pregnancy" if x == 0 else "Secondary \u2014 prior pregnancy")
+                infertile_duration = st.number_input("Duration of infertility (months)", 0.0, 360.0, 36.0, 1.0)
+                menstrual_interval_days = st.number_input("Menstrual cycle length (days)", 15.0, 180.0, 29.0, 1.0)
+                menstrual_duration_days = st.number_input(
+                    "Menstrual bleeding duration (days)", 0.0, 31.0, 4.0, 1.0, key="fv_menstrual_duration"
+                )
+                menstrual = st.selectbox(
+                    "Menstrual regularity", [0, 1], key="fv_menstrual",
+                    format_func=lambda x: "Regular" if x == 0 else "Irregular"
+                )
+                dysmenorrhea = st.selectbox(
+                    "Dysmenorrhea severity", [0, 1, 2, 3], index=1, key="fv_dysmenorrhea",
+                    format_func=lambda x: {0: "0 \u2014 None", 1: "1 \u2014 Mild", 2: "2 \u2014 Moderate", 3: "3 \u2014 Severe"}[x]
+                )
+
+                st.markdown('<div class="form-group-label">Baseline Hormones</div>', unsafe_allow_html=True)
+                fsh_baseline = st.number_input(
+                    "Baseline FSH (IU/L)", 0.0, 40.0, 6.9, 0.1, key="fv_fsh"
+                )
+                lh_baseline = st.number_input("Baseline LH (mIU/mL)", 0.0, 30.0, 5.7, 0.1, key="fv_lh")
+                e2_baseline = st.number_input("Baseline E2 (pg/mL)", 0.0, 300.0, 36.6, 0.1, key="fv_e2")
+                prl_baseline = st.number_input("Baseline prolactin (ng/mL)", 0.0, 150.0, 19.8, 0.1, key="fv_prl")
+
+                st.markdown('<div class="form-group-label">Female Pathology</div>', unsafe_allow_html=True)
+                uterine_factors = st.selectbox("Uterine factor", [0, 1])
+                ovulatory_factors = st.selectbox("Ovulatory factor", [0, 1])
+                tubal_factors = st.selectbox("Tubal factor", [0, 1])
+                endometriosis_factors = st.selectbox("Endometriosis", [0, 1])
+                gyn_surgery = st.selectbox("Prior gynecologic surgery", [0, 1])
+                # All 7 pathology factors are direct features in
+                # FV_FEATURES (Full35); the main-form/expander split is
+                # layout only, not a modeling distinction.
+                with st.expander("Other pathology factors (ovarian, cervical, multisystem)"):
+                    ovarian_factors = st.selectbox("Ovarian factor", [0, 1], key="fv_ovarian")
+                    cervical_factors = st.selectbox("Cervical factor", [0, 1], key="fv_cervical")
+                    multisystem_factors = st.selectbox("Multisystem factor", [0, 1], key="fv_multi")
+                # Displayed total excludes Multisystem_Factors (still
+                # sent separately as its own direct feature) to match
+                # PATHOLOGY_COLS / compute_fv_features().
+                total_female_pathology = float(
+                    uterine_factors + tubal_factors + ovarian_factors +
+                    ovulatory_factors + cervical_factors + endometriosis_factors
+                )
+                st.caption(f"Total female pathology score: **{total_female_pathology:.0f}** (auto-computed from six factors above; multisystem factor is used by the model as its own separate feature, not summed here)")
+
+                st.markdown('<div class="form-group-label">Reproductive History</div>', unsafe_allow_html=True)
+                pregnancy_history = st.number_input(
+                    "Number of prior pregnancies", 0, 8, 0, 1, key="fv_pregnancy_history"
+                )
+                number_of_alive_children = st.number_input(
+                    "Number of living children", 0, 5, 0, 1, key="fv_alive_children"
+                )
+                number_of_miscarriages = st.number_input(
+                    "Number of miscarriages", 0, 6, 0, 1, key="fv_miscarriages"
+                )
+
+            with col2:
+                st.markdown('<div class="form-group-label">Initial Semen Analysis</div>', unsafe_allow_html=True)
+                first_volume = st.number_input("Volume (mL)", 0.0, 20.0, 3.0, 0.1)
+                first_count = st.number_input("Sperm concentration (\u00d710\u2076/mL)", 0.0, 500.0, 41.3, 0.1)
+                first_motile = st.number_input("Total motility (%)", 0.0, 100.0, 54.7, 0.1, key="fv_first_motile")
+                first_prog_motile = st.number_input("Progressive motility (%)", 0.0, 100.0, 52.6, 0.1)
+                first_normal_morpho = st.number_input(
+                    "Normal morphology (%)", 0.0, 100.0, 5.0, 0.1, key="fv_normal_morpho"
+                )
+
+                st.markdown('<div class="form-group-label">Lifestyle (Male Partner)</div>', unsafe_allow_html=True)
+                alcohol = st.selectbox(
+                    "Alcohol use", list(ALCOHOL_LABELS.keys()), index=0, key="fv_alcohol",
+                    format_func=lambda x: ALCOHOL_LABELS[x]
+                )
+                smoke = st.selectbox(
+                    "Smoking", list(SMOKE_LABELS.keys()), index=0, key="fv_smoke",
+                    format_func=lambda x: SMOKE_LABELS[x]
+                )
+
+        cycle_label = st.text_input("Cycle label (optional)", placeholder="e.g. Cycle 1, Jan 2025")
+        submitted = st.form_submit_button("Calculate Pregnancy Probability", use_container_width=True, type="primary")
+
+    if submitted:
+        raw_inputs = {
+            "Age_Female": age_female, "Body_Mass_Index": bmi,
+            "Menstrual_Interval_Days": menstrual_interval_days,
+            "Menstrual_Duration_Days": menstrual_duration_days if model_type == "first_visit" else None,
+            "First_Volume": first_volume, "First_Count": first_count,
+            "First_Motile": first_motile if model_type == "first_visit" else None,
+            "First_Progressive_Motile": first_prog_motile,
+            "First_Normal_Morpho": first_normal_morpho if model_type == "first_visit" else None,
+            "Total_infertile_duration": infertile_duration if model_type == "first_visit" else None,
+            "Alcohol": alcohol if model_type == "first_visit" else None,
+            "Smoke": smoke if model_type == "first_visit" else None,
+            "Pre_TPMSC": pre_tpmsc if model_type == "postwash" else None,
+            "Post_Count": post_count if model_type == "postwash" else None,
+            "Post_TPMSC": post_tpmsc if model_type == "postwash" else None,
+            "Age_Male": age_male if model_type == "first_visit" else None,
+            "FSH_Baseline": fsh_baseline,
+            "LH_Baseline": lh_baseline,
+            "E2_Baseline": e2_baseline if model_type == "first_visit" else None,
+            "PRL_Baseline": prl_baseline if model_type == "first_visit" else None,
+            "Dysmenorrhea": dysmenorrhea if model_type == "first_visit" else None,
+            "Menstrual": menstrual if model_type == "first_visit" else None,
+            "Pregnancy_History": pregnancy_history if model_type == "first_visit" else None,
+            "Number_Of_Alive_Children": number_of_alive_children if model_type == "first_visit" else None,
+            "Number_Of_Miscarriages": number_of_miscarriages if model_type == "first_visit" else None,
+        }
+        for w in validate_inputs({k: v for k, v in raw_inputs.items() if v is not None}):
+            st.markdown(f'<div class="val-warn">\u26a0\ufe0f Value out of expected range \u2014 {w}</div>', unsafe_allow_html=True)
+
+        try:
+            with st.spinner("Calculating..."):
+                # Routes through compute_pw_features()/compute_fv_features()
+                # instead of re-implementing the engineered-feature
+                # formulas inline, avoiding a duplicate copy of the logic.
+                if model_type == "postwash":
+                    raw_row = {
+                        "Uterine_Factors": uterine_factors, "Tubal_Factors": tubal_factors,
+                        "Ovarian_Factors": ovarian_factors, "Ovulatory_Factors": ovulatory_factors,
+                        "Cervical_Factors": cervical_factors, "Endometriosis_Factors": endometriosis_factors,
+                        "Multisystem_Factors": multisystem_factors,
+                        "Gynecological_Surgical_History": gyn_surgery,
+                        "Menstrual_Interval_Days": menstrual_interval_days,
+                        "First_Count": first_count,
+                        "First_Progressive_Motile": first_prog_motile,
+                        "Post_TPMSC": post_tpmsc, "Post_Count": post_count,
+                        "Pre_TPMSC": pre_tpmsc,
+                        "Age_Female": age_female,
+                        "FSH_Baseline": fsh_baseline,
+                    }
+                    X = compute_pw_features(pd.DataFrame([raw_row]))
+                else:
+                    raw_row = {
+                        "Age_Female": age_female, "Age_Male": age_male, "Body_Mass_Index": bmi,
+                        "Infertility_Type": infertility_type,
+                        "Total_infertile_duration": infertile_duration,
+                        "Pregnancy_History": pregnancy_history,
+                        "Number_Of_Alive_Children": number_of_alive_children,
+                        "Number_Of_Miscarriages": number_of_miscarriages,
+                        "Menstrual": menstrual,
+                        "Menstrual_Interval_Days": menstrual_interval_days,
+                        "Menstrual_Duration_Days": menstrual_duration_days,
+                        "Dysmenorrhea": dysmenorrhea,
+                        "FSH_Baseline": fsh_baseline, "LH_Baseline": lh_baseline,
+                        "E2_Baseline": e2_baseline, "PRL_Baseline": prl_baseline,
+                        "Uterine_Factors": uterine_factors, "Tubal_Factors": tubal_factors,
+                        "Ovarian_Factors": ovarian_factors, "Ovulatory_Factors": ovulatory_factors,
+                        "Cervical_Factors": cervical_factors, "Endometriosis_Factors": endometriosis_factors,
+                        "Multisystem_Factors": multisystem_factors,
+                        "Gynecological_Surgical_History": gyn_surgery,
+                        "Alcohol": alcohol, "Smoke": smoke,
+                        "First_Volume": first_volume, "First_Count": first_count,
+                        "First_Motile": first_motile,
+                        "First_Progressive_Motile": first_prog_motile,
+                        "First_Normal_Morpho": first_normal_morpho,
+                    }
+                    X = compute_fv_features(pd.DataFrame([raw_row]))
+
+
+                p_val = float(predict(X, model_type)[0])
+                against, favor = get_factors(X, model_type, top_k=5)
+
+            tier_info = assign_tier(p_val, model_type)
+            render_result(p_val, model_type, tier_info=tier_info)
+            st.markdown('<div class="section-header">What is influencing this result?</div>', unsafe_allow_html=True)
+            render_factors(against, favor)
+            add_to_history(p_val, model_type, against, favor, label=cycle_label or "", tier_info=tier_info)
+
+            st.markdown('<div class="section-header">Download Report</div>', unsafe_allow_html=True)
+            pdf_buf = generate_pdf_report(p_val, model_type, against, favor, patient_id=cycle_label)
+            st.download_button("📄 Download PDF Summary", data=pdf_buf,
+                               file_name=f"IUI_report_{now_th().strftime('%Y%m%d_%H%M')}.pdf",
+                               mime="application/pdf", use_container_width=True)
+        except Exception as e:
+            st.error(str(e))
+
+    render_cycle_history()
+
+elif "Multiple" in page:
+    st.markdown('<div class="section-header">📂 Multiple Patients — Batch Prediction</div>', unsafe_allow_html=True)
+    model_choice = st.radio("Which model?",["🔬 Procedure-Day Model","🏥 Pre-treatment Model"],horizontal=True)
+    model_type   = "postwash" if "Procedure-Day" in model_choice else "first_visit"
+    st.write("Upload a CSV file with one row per patient cycle. Download the template from the sidebar.")
+    uploaded = st.file_uploader("Upload CSV", type=["csv"], key="upl_calc")
+    if uploaded is not None:
+        df_raw = pd.read_csv(uploaded)
+        st.write(f"**{len(df_raw)} records loaded** — preview:")
+        st.dataframe(df_raw.head(), use_container_width=True)
+        render_batch_validation_warnings(df_raw)
+        if st.button("Calculate Probabilities", use_container_width=True, type="primary"):
+            try:
+                with st.spinner("Processing..."):
+                    X      = compute_pw_features(df_raw) if model_type == "postwash" else compute_fv_features(df_raw)
+                    p_cals = predict(X, model_type)
+                    tiers  = [assign_tier(float(p), model_type) for p in p_cals]
+                    out    = df_raw.copy()
+                    out["Pregnancy probability"] = [fmt_prob(float(p)) for p in p_cals]
+                    out["Pregnancy Probability Tier"] = [t[0] for t in tiers]
+                st.success(f"Done — {len(out)} records processed")
+                from collections import Counter
+                counts = Counter([t[1] for t in tiers])
+                c1, c2 = st.columns(2)
+                c1.metric("🔴 Low Probability", counts.get("low", 0))
+                c2.metric("🟢 High Probability", counts.get("high", 0))
+                st.dataframe(out[["Pregnancy probability", "Pregnancy Probability Tier"]], use_container_width=True, hide_index=True)
+                st.download_button("⬇️ Download Full Results", out.to_csv(index=False).encode("utf-8"),
+                                   "iui_predictions.csv","text/csv", use_container_width=True)
+            except Exception as e:
+                st.error(str(e))
+
+elif "Detailed" in page:
+    st.markdown('<div class="section-header">🔍 Detailed Analysis — Single Patient</div>', unsafe_allow_html=True)
+    st.write("Upload a CSV, select a row, and see a full breakdown of what is driving the prediction for that patient.")
+    model_choice = st.radio("Which model?",["🔬 Procedure-Day Model","🏥 Pre-treatment Model"],horizontal=True)
+    model_type   = "postwash" if "Procedure-Day" in model_choice else "first_visit"
+    uploaded2 = st.file_uploader("Upload CSV", type=["csv"], key="upl_exp")
+    if uploaded2 is not None:
+        df_raw2 = pd.read_csv(uploaded2)
+        st.dataframe(df_raw2.head(), use_container_width=True)
+        row_idx = st.number_input("Select row to analyse", 0, max(0, len(df_raw2)-1), 0, 1)
+        render_batch_validation_warnings(df_raw2.iloc[[int(row_idx)]])
+        if st.button("Analyse This Patient", type="primary"):
+            try:
+                with st.spinner("Analysing..."):
+                    X2    = compute_pw_features(df_raw2) if model_type == "postwash" else compute_fv_features(df_raw2)
+                    x_row = X2.iloc[[int(row_idx)]].copy()
+                    p_val = float(predict(x_row, model_type)[0])
+                    against, favor = get_factors(x_row, model_type, top_k=5)
+                render_result(p_val, model_type)
+                st.markdown('<div class="section-header">What is influencing this result?</div>', unsafe_allow_html=True)
+                render_factors(against, favor)
+                pdf_buf = generate_pdf_report(p_val, model_type, against, favor)
+                st.download_button("📄 Download PDF Summary", data=pdf_buf,
+                                   file_name=f"IUI_report_row{row_idx}.pdf", mime="application/pdf",
+                                   use_container_width=True)
+                with st.expander("Show technical SHAP chart"):
+                    try:
+                        fig = plot_shap_waterfall(x_row, model_type)
+                        st.pyplot(fig, use_container_width=True)
+                        plt.close(fig)
+                    except Exception:
+                        st.info("SHAP chart could not be generated.")
+            except Exception as e:
+                st.error(str(e))
+
+elif "About" in page:
+    st.markdown('<div class="section-header">ℹ️ About This Tool</div>', unsafe_allow_html=True)
+
+    st.markdown(
+        "This tool estimates the probability of clinical pregnancy per IUI cycle, "
+        "based on machine learning models developed from a retrospective cohort "
+        "at a Thai fertility center. It is intended to support patient counseling — "
+        "not to replace clinical judgment."
+    )
+
+    st.markdown('<div class="section-header">Which model should I use?</div>', unsafe_allow_html=True)
+
+    col1, col2 = st.columns(2)
+
+    with col1:
+        st.markdown("""
+        <div class="info-card">
+            <span class="badge-pw">🔬 Procedure-Day Model</span>
+            <h3>Use on the day of IUI</h3>
+            <p style="color:#475569;font-size:0.92rem;line-height:1.7;">
+                Requires sperm wash results. Use on the day of IUI, once postwash semen
+                parameters are available.
+            </p>
+            <p style="color:#94a3b8;font-size:0.85rem;margin-top:0.5rem;">
+                ROC-AUC 0.680 &nbsp;·&nbsp; Sensitivity 73.2% &nbsp;·&nbsp; NPV 96.5%
+            </p>
+        </div>
+        """, unsafe_allow_html=True)
+
+    with col2:
+        st.markdown("""
+        <div class="info-card">
+            <span class="badge-fv">🏥 Pre-treatment Model</span>
+            <h3>Use before treatment starts</h3>
+            <p style="color:#475569;font-size:0.92rem;line-height:1.7;">
+                Requires only baseline clinical data and the initial semen analysis. Use to
+                counsel patients before treatment starts — no sperm wash results needed.
+            </p>
+            <p style="color:#94a3b8;font-size:0.85rem;margin-top:0.5rem;">
+                ROC-AUC 0.647 &nbsp;·&nbsp; Sensitivity 58.5% &nbsp;·&nbsp; NPV 95.3%
+            </p>
+        </div>
+        """, unsafe_allow_html=True)
+
+    st.markdown('<div class="section-header">How to read the result</div>', unsafe_allow_html=True)
+
+    st.markdown("""
+    **The probability (%)** is the model's estimate of how likely this patient is to achieve clinical pregnancy in this cycle. Values below 1% or above 30% are shown as "<1%" or ">30%", because estimates at the extremes are imprecise in this cohort.
+
+    **The pregnancy probability tier** shows where this patient falls compared with patients in the development cohort:
+
+    | Pregnancy probability tier | What it means |
+    |---|---|
+    | 🔴 Low Probability | Lower predicted probability compared with the cohort |
+    | 🟢 High Probability | Higher predicted probability compared with the cohort |
+
+    **The factors chart** shows which parameters increase or decrease the model's base prediction for this patient (before probability calibration). Bars show how strongly each factor influences the result — Strong, Moderate, or Mild. These are statistical associations from the model, not confirmed causal effects.
+    """)
+
+    with st.expander("Technical details — for researchers"):
+        st.markdown("""
+        **Algorithm:** CatBoost (Procedure-Day, 11 features) / CatBoost (Pre-treatment, 35 features),
+        both with isotonic regression calibration; algorithms selected via a primary
+        ranking metric (grouped-CV PR-AUC) used to screen candidates, with evidence-based review before
+        confirming (not simply the highest-PR-AUC candidate accepted automatically)  
+        **Cohort:** 2,945 cycles, 1,761 patients (single-center, Thailand)  
+        **Validation:** Internal patient-level holdout (external validation not yet performed)
+
+        | Metric | Procedure-Day (11 features) | Pre-treatment (35 features) |
+        |---|---:|---:|
+        | ROC-AUC | 0.680 (0.606–0.753) | 0.647 (0.570–0.721) |
+        | Sensitivity | 73.2% | 58.5% |
+        | Specificity | 55.2% | 61.3% |
+        | NPV | 96.5% | 95.3% |
+        | Calibrated Brier | 0.068 | 0.064 |
+
+        Discrimination is modest for both models; the 95% confidence intervals for ROC-AUC overlap
+        substantially, and the two models were not formally compared. Calibrated Brier scores did not outperform the constant-prevalence no-skill
+        benchmark for either model on the held-out test set (no-skill Brier = 0.064 for both).
+        """)
+
+    st.markdown("""
+    <div class="disclaimer">
+        This tool is a research application for academic purposes only. It is intended to support clinical judgment
+        and should not be used as the sole basis for clinical decision-making. Outputs are statistical estimates
+        derived from a single-center retrospective cohort of IUI cycles performed at a Thai fertility center.
+        External validation on an independent cohort has not yet been performed.
+    </div>
+    """, unsafe_allow_html=True)
