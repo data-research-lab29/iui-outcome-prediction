@@ -17,11 +17,7 @@ from selenium.webdriver.chrome.service import Service
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
-from webdriver_manager.chrome import ChromeDriverManager
 
-# Set this to your app's URL, or override with the STREAMLIT_APP_URL
-# environment variable (set as a GitHub Actions secret / env var so the
-# URL isn't hardcoded if you ever change it).
 APP_URL = os.environ.get(
     "STREAMLIT_APP_URL",
     "https://iui-outcome-prediction-memnxer5pxjwx2j6tapp2ry.streamlit.app/",
@@ -40,18 +36,25 @@ def build_driver():
     options.add_argument("--no-sandbox")
     options.add_argument("--disable-dev-shm-usage")
     options.add_argument("--window-size=1280,1696")
-    service = Service(ChromeDriverManager().install())
+    # Use the Chrome/ChromeDriver installed by the workflow when available;
+    # otherwise let Selenium Manager (built into Selenium 4.6+) find them.
+    chrome_bin = os.environ.get("CHROME_BIN")
+    if chrome_bin:
+        options.binary_location = chrome_bin
+    driver_bin = os.environ.get("CHROMEDRIVER_BIN")
+    service = Service(executable_path=driver_bin) if driver_bin else Service()
     return webdriver.Chrome(service=service, options=options)
 
 
 def main():
-    driver = build_driver()
+    try:
+        driver = build_driver()
+    except Exception as exc:
+        print(f"ping_app.py could not start Chrome: {exc}")
+        sys.exit(1)
     try:
         print(f"Visiting {APP_URL} ...")
         driver.get(APP_URL)
-
-        # Give the page a moment to render (sleeping-app screen is a
-        # normal Streamlit component, not instant).
         time.sleep(5)
 
         wake_button = None
@@ -64,14 +67,8 @@ def main():
         if wake_button is not None:
             print("App was asleep. Clicking the wake-up button ...")
             wake_button.click()
-
-            # Wait for the app to actually finish booting. We wait for
-            # the sleeping-screen button to disappear as a simple signal
-            # that Streamlit has started serving the real app.
             try:
-                WebDriverWait(driver, 90).until(
-                    EC.staleness_of(wake_button)
-                )
+                WebDriverWait(driver, 90).until(EC.staleness_of(wake_button))
                 print("App appears to have woken up successfully.")
             except Exception:
                 print(
