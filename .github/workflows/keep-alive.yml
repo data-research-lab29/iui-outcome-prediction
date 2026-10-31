@@ -2,15 +2,13 @@ name: Keep Streamlit App Awake
 
 on:
   schedule:
-    # Runs at minute 0 past every 6th hour (00:00, 06:00, 12:00, 18:00 UTC).
-    # GitHub's cron scheduler is best-effort and can be delayed by a few
-    # minutes during high load, which is fine for this purpose.
     - cron: "0 */6 * * *"
-  workflow_dispatch: {}   # lets you trigger it manually from the Actions tab
+  workflow_dispatch: {}
 
 jobs:
   ping:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - name: Check out repository
         uses: actions/checkout@v4
@@ -21,13 +19,11 @@ jobs:
           python-version: "3.11"
 
       - name: Install Google Chrome
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y wget gnupg
-          wget -q -O - https://dl-ssl.google.com/linux/linux_signing_key.pub | sudo apt-key add -
-          sudo sh -c 'echo "deb [arch=amd64] http://dl.google.com/linux/chrome/deb/ stable main" >> /etc/apt/sources.list.d/google-chrome.list'
-          sudo apt-get update
-          sudo apt-get install -y google-chrome-stable
+        id: setup-chrome
+        uses: browser-actions/setup-chrome@v1
+        with:
+          chrome-version: stable
+          install-chromedriver: true
 
       - name: Install Python dependencies
         run: pip install -r keepalive/requirements.txt
@@ -35,4 +31,6 @@ jobs:
       - name: Ping the Streamlit app
         env:
           STREAMLIT_APP_URL: "https://iui-outcome-prediction-memnxer5pxjwx2j6tapp2ry.streamlit.app/"
+          CHROME_BIN: ${{ steps.setup-chrome.outputs.chrome-path }}
+          CHROMEDRIVER_BIN: ${{ steps.setup-chrome.outputs.chromedriver-path }}
         run: python keepalive/ping_app.py
