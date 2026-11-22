@@ -72,11 +72,30 @@ def find_wake_button(driver):
 
 
 def page_text(driver, limit=300):
+    """Title, iframe count, and visible text of the page and of each iframe.
+
+    On *.streamlit.app the app itself runs inside an iframe, so the outer
+    page's own text is usually empty; the app text shows up under frame[i].
+    """
+    parts = []
     try:
         driver.switch_to.default_content()
-        return driver.find_element(By.TAG_NAME, "body").text[:limit].replace("\n", " | ")
+        frames = driver.find_elements(By.TAG_NAME, "iframe")
+        parts.append(f"title={driver.title!r}")
+        parts.append(f"iframes={len(frames)}")
+        parts.append("top=" + repr(driver.find_element(By.TAG_NAME, "body").text[:limit]))
+        for i, frame in enumerate(frames):
+            try:
+                driver.switch_to.frame(frame)
+                text = driver.find_element(By.TAG_NAME, "body").text[:limit]
+                parts.append(f"frame[{i}]=" + repr(text))
+            except Exception as exc:
+                parts.append(f"frame[{i}]=<unreadable: {exc.__class__.__name__}>")
+            finally:
+                driver.switch_to.default_content()
     except Exception as exc:
-        return f"<could not read page text: {exc}>"
+        parts.append(f"<could not read page: {exc}>")
+    return " ; ".join(parts).replace("\\n", " | ")
 
 
 def wait_for_button(driver, seconds):
@@ -115,7 +134,7 @@ def main():
                     break
             else:
                 print("ERROR: the app did not wake up within "
-                      f"{WAKE_TIMEOUT_SECONDS} s. Page text: {page_text(driver)!r}")
+                      f"{WAKE_TIMEOUT_SECONDS} s. Page check: {page_text(driver)}")
                 sys.exit(1)
             print("App woke up.")
         else:
@@ -123,7 +142,7 @@ def main():
 
         print(f"Keeping the page open for {STAY_SECONDS} s so the visit counts ...")
         time.sleep(STAY_SECONDS)
-        print(f"Page text: {page_text(driver)!r}")
+        print(f"Page check: {page_text(driver)}")
         print("Done.")
 
     except Exception as exc:
