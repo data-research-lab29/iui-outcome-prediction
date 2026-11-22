@@ -1,10 +1,16 @@
 """
 Visits a Streamlit Community Cloud app with a real headless browser and,
 if the app is showing the "Zzzz... this app has gone to sleep" screen,
-clicks the wake-up button. A plain HTTP GET (requests/urllib) does NOT
-work for this, because a sleeping app still returns HTTP 200 with a
-static HTML shell -- the Streamlit process itself is not running, so
-nothing short of an actual browser visit can trigger a restart.
+clicks the wake-up button. A plain HTTP GET does NOT work for this,
+because a sleeping app still returns HTTP 200 with a static HTML shell.
+
+Changes from the previous version:
+- Waits up to 45 s for the wake-up button instead of a fixed 5 s, and also
+  looks inside iframes, so a slow page is no longer mistaken for "awake".
+- Stays on the page for STAY_SECONDS on every run, so the visit opens a
+  real session and Streamlit counts it as traffic.
+- Prints part of the page text to the log, so you can see what it saw.
+- Exits with an error (red X in Actions) if the app fails to wake up.
 """
 
 import os
@@ -15,19 +21,22 @@ from selenium import webdriver
 from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.chrome.service import Service
 from selenium.webdriver.common.by import By
-from selenium.webdriver.support.ui import WebDriverWait
-from selenium.webdriver.support import expected_conditions as EC
 
 APP_URL = os.environ.get(
     "STREAMLIT_APP_URL",
     "https://iui-outcome-prediction-memnxer5pxjwx2j6tapp2ry.streamlit.app/",
 )
 
-WAKE_BUTTON_XPATHS = [
-    "//button[contains(., 'get this app back up')]",
-    "//button[contains(., 'Yes, get this app back up')]",
-    "//button[contains(text(), 'Wake')]",
-]
+FIND_BUTTON_SECONDS = 45   # how long to look for the wake-up button
+WAKE_TIMEOUT_SECONDS = 180  # how long to wait for the app to boot after clicking
+STAY_SECONDS = 30          # how long to keep the page open on every run
+
+# Case-insensitive match on the button text.
+WAKE_BUTTON_XPATH = (
+    "//button[contains(translate(normalize-space(.), "
+    "'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), "
+    "'get this app back up')]"
+)
 
 
 def build_driver():
@@ -36,8 +45,6 @@ def build_driver():
     options.add_argument("--no-sandbox")
     options.add_argument("--disable-dev-shm-usage")
     options.add_argument("--window-size=1280,1696")
-    # Use the Chrome/ChromeDriver installed by the workflow when available;
-    # otherwise let Selenium Manager (built into Selenium 4.6+) find them.
     chrome_bin = os.environ.get("CHROME_BIN")
     if chrome_bin:
         options.binary_location = chrome_bin
@@ -46,38 +53,78 @@ def build_driver():
     return webdriver.Chrome(service=service, options=options)
 
 
+def find_wake_button(driver):
+    """Return the wake-up button if present, searching the page and its iframes."""
+    driver.switch_to.default_content()
+    buttons = driver.find_elements(By.XPATH, WAKE_BUTTON_XPATH)
+    if buttons:
+        return buttons[0]
+    for frame in driver.find_elements(By.TAG_NAME, "iframe"):
+        try:
+            driver.switch_to.frame(frame)
+            buttons = driver.find_elements(By.XPATH, WAKE_BUTTON_XPATH)
+            if buttons:
+                return buttons[0]  # stay inside this frame so .click() works
+        except Exception:
+            pass
+        driver.switch_to.default_content()
+    return None
+
+
+def page_text(driver, limit=300):
+    try:
+        driver.switch_to.default_content()
+        return driver.find_element(By.TAG_NAME, "body").text[:limit].replace("\n", " | ")
+    except Exception as exc:
+        return f"<could not read page text: {exc}>"
+
+
+def wait_for_button(driver, seconds):
+    deadline = time.time() + seconds
+    while time.time() < deadline:
+        button = find_wake_button(driver)
+        if button is not None:
+            return button
+        time.sleep(2)
+    return None
+
+
 def main():
     try:
         driver = build_driver()
     except Exception as exc:
-        print(f"ping_app.py could not start Chrome: {exc}")
+        print(f"Could not start Chrome: {exc}")
         sys.exit(1)
+
     try:
         print(f"Visiting {APP_URL} ...")
         driver.get(APP_URL)
-        time.sleep(5)
 
-        wake_button = None
-        for xpath in WAKE_BUTTON_XPATHS:
-            buttons = driver.find_elements(By.XPATH, xpath)
-            if buttons:
-                wake_button = buttons[0]
-                break
+        button = wait_for_button(driver, FIND_BUTTON_SECONDS)
 
-        if wake_button is not None:
-            print("App was asleep. Clicking the wake-up button ...")
-            wake_button.click()
-            try:
-                WebDriverWait(driver, 90).until(EC.staleness_of(wake_button))
-                print("App appears to have woken up successfully.")
-            except Exception:
-                print(
-                    "Warning: wake-up button did not disappear within "
-                    "90 seconds. The app may still be booting; a manual "
-                    "check is recommended."
-                )
+        if button is not None:
+            print("App was ASLEEP. Clicking the wake-up button ...")
+            button.click()
+            driver.switch_to.default_content()
+
+            # Wait until the wake-up button is gone for good.
+            deadline = time.time() + WAKE_TIMEOUT_SECONDS
+            while time.time() < deadline:
+                time.sleep(5)
+                if find_wake_button(driver) is None:
+                    break
+            else:
+                print("ERROR: the app did not wake up within "
+                      f"{WAKE_TIMEOUT_SECONDS} s. Page text: {page_text(driver)!r}")
+                sys.exit(1)
+            print("App woke up.")
         else:
-            print("App was already awake. Nothing to do.")
+            print("No wake-up button found, so the app looks AWAKE.")
+
+        print(f"Keeping the page open for {STAY_SECONDS} s so the visit counts ...")
+        time.sleep(STAY_SECONDS)
+        print(f"Page text: {page_text(driver)!r}")
+        print("Done.")
 
     except Exception as exc:
         print(f"ping_app.py failed: {exc}")
