@@ -2,7 +2,9 @@ name: Keep Streamlit App Awake
 
 on:
   schedule:
-    - cron: "0 */6 * * *"
+    # Every 3 hours at minute 17 (UTC). Runs at the top of the hour are
+    # often delayed by GitHub, so an odd minute is more reliable.
+    - cron: "17 */3 * * *"
   workflow_dispatch: {}
 
 jobs:
